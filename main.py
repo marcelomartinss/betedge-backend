@@ -23,50 +23,86 @@ def log(msg):
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BetEdgeBot/1.0)", "Accept": "application/json"}
 
+# ─────────────────────────────────────────────
+# NBA — ESPN API aberta (sem key, sem bloqueio)
+# ─────────────────────────────────────────────
 def fetch_nba_jogos():
     log("Buscando jogos NBA...")
     try:
-        today = datetime.now(BRASILIA).strftime("%Y-%m-%d")
-        url = f"https://api.balldontlie.io/v1/games?dates[]={today}&per_page=20"
+        today = datetime.now(BRASILIA).strftime("%Y%m%d")
+        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={today}"
         r = requests.get(url, headers=HEADERS, timeout=20)
         data = r.json()
-        games = data.get("data", [])
-        log(f"  {len(games)} jogos NBA encontrados")
+        events = data.get("events", [])
+        log(f"  {len(events)} jogos NBA encontrados")
+
         supabase.table("jogos_hoje").delete().eq("sport", "basquete").execute()
-        for g in games:
-            home = g.get("home_team", {}).get("full_name", "?")
-            away = g.get("visitor_team", {}).get("full_name", "?")
+
+        for ev in events:
+            competitions = ev.get("competitions", [{}])
+            comp = competitions[0] if competitions else {}
+            competitors = comp.get("competitors", [])
+
+            home = next((c.get("team", {}).get("displayName", "?") for c in competitors if c.get("homeAway") == "home"), "?")
+            away = next((c.get("team", {}).get("displayName", "?") for c in competitors if c.get("homeAway") == "away"), "?")
+            home_abbr = next((c.get("team", {}).get("abbreviation", "") for c in competitors if c.get("homeAway") == "home"), "")
+            away_abbr = next((c.get("team", {}).get("abbreviation", "") for c in competitors if c.get("homeAway") == "away"), "")
+
+            # Horário em Brasília
+            date_str = ev.get("date", "")
             horario_br = "?"
             try:
-                dt_str = g.get("date", "")
-                if dt_str:
-                    dt = datetime.strptime(dt_str[:10], "%Y-%m-%d")
-                    horario_br = "NBA " + dt.strftime("%d/%m")
+                dt_utc = datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=pytz.utc)
+                dt_br = dt_utc.astimezone(BRASILIA)
+                horario_br = dt_br.strftime("%H:%M")
             except:
                 pass
+
+            status = ev.get("status", {}).get("type", {}).get("name", "agendado")
+            serie_info = comp.get("series", {})
+            serie_txt = ""
+            if serie_info:
+                wins_home = serie_info.get("competitors", [{}])[0].get("wins", 0) if serie_info.get("competitors") else 0
+                wins_away = serie_info.get("competitors", [{}])[1].get("wins", 0) if len(serie_info.get("competitors", [])) > 1 else 0
+                serie_txt = f"Série: {away_abbr} {wins_away}-{wins_home} {home_abbr}"
+
+            # Lesões
             ausencias = buscar_lesoes_espn_nba(home, away)
+
             jogo = {
-                "sport": "basquete", "liga": "NBA",
-                "time_casa": home, "time_fora": away,
-                "horario_brasilia": horario_br, "status": "agendado",
-                "ausencias": json.dumps(ausencias), "odds": json.dumps({}),
+                "sport": "basquete",
+                "liga": "NBA Playoffs" if serie_txt else "NBA",
+                "time_casa": home,
+                "time_fora": away,
+                "horario_brasilia": horario_br,
+                "status": "agendado",
+                "ausencias": json.dumps(ausencias),
+                "odds": json.dumps({"serie": serie_txt}),
                 "updated_at": datetime.now(BRASILIA).isoformat(),
             }
             result = supabase.table("jogos_hoje").insert(jogo).execute()
             jogo_id = result.data[0]["id"] if result.data else None
+
             if ausencias and jogo_id:
                 for aus in ausencias:
-                    existing = supabase.table("alertas").select("id").eq("tipo", "ausencia").ilike("titulo", f"%{aus['jogador']}%").execute()
+                    existing = supabase.table("alertas").select("id")\
+                        .eq("tipo", "ausencia")\
+                        .ilike("titulo", f"%{aus['jogador']}%")\
+                        .execute()
                     if not existing.data:
                         supabase.table("alertas").insert({
                             "tipo": "ausencia",
                             "titulo": f"AUSENCIA NBA - {aus['jogador']} ({aus['time']})",
-                            "descricao": f"{aus['jogador']} fora para {away} @ {home}. Status: {aus.get('status','?')}",
-                            "jogo_id": jogo_id, "sport": "basquete",
-                            "prioridade": "alta", "fonte": "ESPN",
+                            "descricao": f"{aus['jogador']} fora para {away} @ {home}. Status: {aus.get('status','?')}. {serie_txt}",
+                            "jogo_id": jogo_id,
+                            "sport": "basquete",
+                            "prioridade": "alta",
+                            "fonte": "ESPN",
                         }).execute()
-                        log(f"  ALERTA: {aus['jogador']} ausente")
-            log(f"  NBA: {away} @ {home}")
+                        log(f"  ALERTA AUSENCIA: {aus['jogador']} - {aus['time']}")
+
+            log(f"  NBA: {away} @ {home} {horario_br} {serie_txt}")
+
     except Exception as e:
         log(f"Erro NBA: {e}")
 
@@ -78,15 +114,21 @@ def buscar_lesoes_espn_nba(home, away):
         data = r.json()
         for item in data.get("items", []):
             team_name = item.get("team", {}).get("displayName", "")
-            if any(w in team_name for w in home.split()[:2]) or any(w in team_name for w in away.split()[:2]):
+            home_words = home.split()[:2]
+            away_words = away.split()[:2]
+            if any(w in team_name for w in home_words) or any(w in team_name for w in away_words):
                 for inj in item.get("injuries", []):
                     status = inj.get("status", "")
                     if status in ["Out", "Doubtful", "Questionable"]:
-                        lesoes.append({"jogador": inj.get("athlete", {}).get("displayName", "?"), "time": team_name, "status": status})
+                        athlete = inj.get("athlete", {}).get("displayName", "?")
+                        lesoes.append({"jogador": athlete, "time": team_name, "status": status})
     except Exception as e:
-        log(f"  Erro lesoes ESPN: {e}")
+        log(f"  Erro lesoes NBA: {e}")
     return lesoes
 
+# ─────────────────────────────────────────────
+# FUTEBOL — TheSportsDB
+# ─────────────────────────────────────────────
 def fetch_futebol_jogos():
     log("Buscando jogos de futebol...")
     try:
@@ -166,34 +208,61 @@ def fetch_escalacoes_futebol():
     except Exception as e:
         log(f"Erro escalacoes: {e}")
 
+# ─────────────────────────────────────────────
+# MATCHUPS IA — análise profunda playoffs
+# ─────────────────────────────────────────────
 def gerar_matchups_ia():
     log("Gerando matchups com IA...")
     try:
         jogos = supabase.table("jogos_hoje").select("*").execute()
         if not jogos.data:
-            log("  Sem jogos pra analisar")
+            log("  Sem jogos")
             return
-        resumo = [f"{j['sport'].upper()} | {j['liga']} | {j['time_fora']} @ {j['time_casa']} | {j['horario_brasilia']}" for j in jogos.data[:10]]
+
+        nba_jogos = [j for j in jogos.data if j["sport"] == "basquete"]
+        fut_jogos = [j for j in jogos.data if j["sport"] == "futebol"]
+
+        resumo_nba = [f"NBA PLAYOFFS | {j['liga']} | {j['time_fora']} @ {j['time_casa']} | {j['horario_brasilia']} | Ausencias: {j.get('ausencias','[]')}" for j in nba_jogos]
+        resumo_fut = [f"FUTEBOL | {j['liga']} | {j['time_fora']} @ {j['time_casa']} | {j['horario_brasilia']}" for j in fut_jogos[:6]]
+
         hoje = datetime.now(BRASILIA).strftime("%d/%m/%Y")
-        prompt = f"""Voce e um analista especialista em apostas esportivas de valor alto (VALUE BETS).
+        prompt = f"""Voce e um analista especialista em VALUE BETS com odds altas.
 
-Hoje e {hoje}. Jogos:
-{chr(10).join(resumo)}
+Hoje e {hoje}. FASE DE PLAYOFFS NBA — momento ideal para props de jogadores.
 
-Analise os 3 melhores matchups para apostas com ODDS ALTAS (2.0+).
-Para cada um retorne:
+JOGOS NBA HOJE:
+{chr(10).join(resumo_nba) if resumo_nba else "Sem jogos NBA"}
 
+JOGOS FUTEBOL HOJE:
+{chr(10).join(resumo_fut) if resumo_fut else "Sem jogos futebol"}
+
+ANALISE OS 3-5 MELHORES MERCADOS DE VALOR para hoje.
+
+Para NBA Playoffs, considere:
+- Props de jogadores: pontos, rebotes, assistencias, trios
+- Impacto de ausencias nas props dos outros jogadores
+- Tendencias da serie atual (quem esta dominando)
+- Minutagem esperada em playoffs (mais intensa)
+- Historico do jogador em playoffs vs temporada regular
+
+Para futebol considere:
+- Escanteios 1T over/under (media dos times)
+- Finalizacoes jogador/time no 1T
+- Desarmes (quem marca quem, mapa de calor)
+- Chutes fora da area (times que cedem/executam)
+
+Para cada entrada retorne:
+
+**MERCADO:** descricao completa
 **JOGO:** time A vs time B
-**MERCADO:** mercado especifico (NAO resultado 1x2)
-**FUNDAMENTO:** estatisticas e tendencias
+**FUNDAMENTO:** dados, tendencias, contexto
 **ODD ESPERADA:** valor
 **CONFIANCA:** 1-10
-**STAKE:** % da banca (max 2% normal, 0.5% big odd)
+**STAKE:** % da banca (0.5% big odd acima de 4.0, 1-2% odds menores)
+**TIMING:** se precisa confirmar algo antes (escalacao, ausencia)
 
-Foco futebol: Escanteios 1T, Finalizacoes, Desarmes, Chutes fora area
-Foco NBA: Props pts/reb/ast, playoffs matchups
+Seja cirurgico. Prefira qualidade a quantidade. Odds acima de 2.0 com fundamento solido."""
 
-Sem fundamento = sem entrada."""
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
             headers={"Content-Type": "application/json"},
@@ -202,14 +271,18 @@ Sem fundamento = sem entrada."""
         )
         data = r.json()
         analise = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Sem analise")
+
         supabase.table("alertas").insert({
             "tipo": "matchup",
             "titulo": f"MATCHUPS DO DIA - {hoje}",
             "descricao": analise,
-            "sport": "geral", "prioridade": "normal",
-            "fonte": "BetEdge IA", "lido": False,
+            "sport": "geral",
+            "prioridade": "normal",
+            "fonte": "BetEdge IA",
+            "lido": False,
         }).execute()
         log("  Matchups salvos!")
+
     except Exception as e:
         log(f"Erro matchups: {e}")
 
