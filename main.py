@@ -18,7 +18,7 @@ load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 BRASILIA = pytz.timezone("America/Sao_Paulo")
@@ -272,22 +272,13 @@ Foque em: escanteios 1T, finalizações, desarmes, props de jogadores NBA (pts/r
 Seja direto. Sem jogo sem fundamento = sem entrada."""
 
         r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                "messages": [{"role": "user", "content": prompt}]
-            },
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=60
         )
         data = r.json()
-        analise = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+        analise = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Sem análise disponível")
 
         # Salva como alerta de matchup
         supabase.table("alertas").insert({
